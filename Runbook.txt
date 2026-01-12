@@ -1,0 +1,885 @@
+Below is a **single source-of-truth runbook** for **Ollama + GGUF models + Open WebUI** on a **single Linux host** and in **Kubernetes**, including: restart/clean-restart steps, troubleshooting, model defaults (`num_ctx`, `num_predict`, etc.), Open WebUI settings + guardrails, k8s manifests, and an MLOps-style deployment approach for large fine-tuned models.
+
+I’m going to be blunt where needed: **CPU-only + enterprise concurrency** has hard limits. You can still ship it, but you must set guardrails and scale by adding nodes, limiting context/tokens, and/or using smaller models/quant.
+
+---
+
+# RUNBOOK: Ollama + Open WebUI (Linux + Kubernetes)
+
+## 0) Architecture and Responsibilities
+
+### Components
+
+* **Ollama** = inference server + model registry/store
+
+  * serves HTTP API on `11434`
+  * owns model files and KV cache
+  * endpoints: `/api/tags` (model list), `/api/generate` and `/api/chat` (inference)
+
+* **Open WebUI** = UI + user/chat persistence + parameter UI
+
+  * calls Ollama via `OLLAMA_BASE_URL`
+  * **does not read GGUF files**
+  * “model list” comes from Ollama `/api/tags`
+
+### Data flow
+
+Browser → Open WebUI → Ollama HTTP API → llama.cpp runner → GGUF model in Ollama store
+
+### Critical implication
+
+If Ollama sees a model in `/api/tags`, Open WebUI can show it. If not, Open WebUI can’t.
+
+---
+
+# 1) Linux Host Runbook
+
+## 1.1 Verify Ollama is up and models are visible
+
+**Check listener**
+
+```bash
+sudo ss -lntp | grep 11434 || sudo lsof -iTCP:11434 -sTCP:LISTEN
+```
+
+**List models (API source of truth)**
+
+```bash
+curl -sS http://127.0.0.1:11434/api/tags | jq
+```
+
+**List models (CLI)**
+
+```bash
+ollama list
+```
+
+---
+
+## 1.2 Common failure: “generate hangs / no response / curl times out”
+
+### Symptoms you hit
+
+* `curl` connects and sends request, then no bytes received until timeout
+* `ollama run <model>` spinner stuck (`⠴`)
+
+### Root causes (top)
+
+1. Ollama runner wedged / deadlocked (restart fixes)
+2. Host hardening: `/tmp` mounted `noexec` or SELinux blocks runner
+3. Broken model artifact/import (less likely once **all models** hang)
+
+### First response: check Ollama health quickly
+
+```bash
+curl -sS --max-time 2 http://127.0.0.1:11434/api/tags ; echo
+echo "exit_code=$?"
+```
+
+### Force inference test with timeouts (avoid infinite hang)
+
+```bash
+curl -sS --connect-timeout 2 --max-time 30 \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2:0.5b","prompt":"Return exactly OK.","stream":false,"options":{"num_predict":8}}' \
+  http://127.0.0.1:11434/api/generate ; echo
+echo "exit_code=$?"
+```
+
+### Clean restart Ollama (what fixed you)
+
+If systemd:
+
+```bash
+sudo systemctl restart ollama
+sudo systemctl status ollama --no-pager
+```
+
+If not systemd:
+
+```bash
+sudo pkill -f "ollama serve" || true
+OLLAMA_HOST=127.0.0.1:11434 ollama serve
+```
+
+### If it keeps happening: check `/tmp` noexec + SELinux
+
+**/tmp options**
+
+```bash
+findmnt -no TARGET,OPTIONS /tmp || mount | grep " /tmp "
+```
+
+If `noexec` present → set `OLLAMA_TMPDIR`:
+
+```bash
+sudo mkdir -p /var/tmp/ollama-tmp
+sudo chmod 1777 /var/tmp/ollama-tmp
+```
+
+systemd override:
+
+```bash
+sudo systemctl edit ollama
+```
+
+Add:
+
+```ini
+[Service]
+Environment=OLLAMA_TMPDIR=/var/tmp/ollama-tmp
+```
+
+Restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+**SELinux**
+
+```bash
+getenforce
+```
+
+If `Enforcing`, it may block execution. Proof-only test:
+
+```bash
+sudo setenforce 0
+getenforce
+```
+
+If that fixes it, you need a proper SELinux policy/labels later.
+
+---
+
+## 1.3 Keep Ollama running in background (production on Linux)
+
+### Prefer systemd
+
+Check:
+
+```bash
+sudo systemctl status ollama --no-pager
+```
+
+If not installed, create:
+
+```bash
+which ollama
+```
+
+Then:
+
+```bash
+sudo tee /etc/systemd/system/ollama.service >/dev/null <<'EOF'
+[Unit]
+Description=Ollama Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=2
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Environment=OLLAMA_KEEP_ALIVE=30m
+# Optional hardening /tmp issues:
+# Environment=OLLAMA_TMPDIR=/var/tmp/ollama-tmp
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now ollama
+sudo journalctl -u ollama -f
+```
+
+### Notes
+
+* Binding to `127.0.0.1` is safest on a single host.
+* `OLLAMA_KEEP_ALIVE=30m` keeps models warm (RAM tradeoff).
+
+---
+
+# 2) Open WebUI Runbook (Linux process install)
+
+## 2.1 How Open WebUI finds models
+
+* WebUI calls `OLLAMA_BASE_URL/api/tags`
+* WebUI does not load GGUF or touch Ollama storage
+
+## 2.2 Start Open WebUI and bind to browser
+
+On the same host as Ollama:
+
+```bash
+export OLLAMA_BASE_URL="http://127.0.0.1:11434"
+export WEBUI_HOST="0.0.0.0"
+export WEBUI_PORT="8080"
+
+open-webui serve
+```
+
+Verify it’s listening:
+
+```bash
+sudo ss -lntp | grep :8080 || sudo lsof -i:8080
+```
+
+Quick HTTP check (don’t hang forever):
+
+```bash
+curl -sS --max-time 3 http://127.0.0.1:8080/ -I
+```
+
+### Port conflict
+
+Find who owns 8080:
+
+```bash
+sudo ss -lntp | grep :8080
+sudo lsof -i :8080
+```
+
+Kill by PID:
+
+```bash
+sudo kill <PID>
+# if needed:
+sudo kill -9 <PID>
+```
+
+### If curl connects but never returns (you saw this)
+
+That means WebUI is stuck initializing. Fix approach:
+
+* restart Open WebUI in foreground to see logs
+* ensure `OLLAMA_BASE_URL` resolves and Ollama responds
+
+Kill and restart:
+
+```bash
+sudo kill <openwebui_pid>
+export OLLAMA_BASE_URL="http://127.0.0.1:11434"
+export WEBUI_HOST="0.0.0.0"
+export WEBUI_PORT="8080"
+open-webui serve
+```
+
+## 2.3 Run Open WebUI as a service (recommended)
+
+Find the binary:
+
+```bash
+which open-webui || which openwebui
+```
+
+Create service:
+
+```bash
+sudo tee /etc/systemd/system/openwebui.service >/dev/null <<'EOF'
+[Unit]
+Description=Open WebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=OLLAMA_BASE_URL=http://127.0.0.1:11434
+Environment=WEBUI_HOST=0.0.0.0
+Environment=WEBUI_PORT=8080
+ExecStart=/usr/local/bin/open-webui serve
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now openwebui
+sudo journalctl -u openwebui -f
+```
+
+---
+
+# 3) Model Defaults and Guardrails
+
+You asked to enforce:
+
+* `num_ctx 2048`
+* `num_predict 512`
+* `temperature 0.3`
+* `top_p 0.9`
+* `top_k 40`
+
+There are **two places** to do it:
+
+## 3.1 Enforce defaults in Ollama Modelfile (best “source of truth”)
+
+This applies to **all clients** (CLI, curl, Open WebUI).
+
+### Example Modelfile for your fine-tuned GGUF
+
+```text
+FROM /models/qwen-cloudqa.gguf
+
+PARAMETER num_ctx 2048
+PARAMETER num_predict 512
+PARAMETER temperature 0.3
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+```
+
+Create model:
+
+```bash
+ollama create qwen-cloudqa:latest -f Modelfile
+ollama list
+```
+
+Verify:
+
+```bash
+ollama show qwen-cloudqa:latest
+curl -sS http://127.0.0.1:11434/api/tags | jq
+```
+
+### Why Modelfile defaults matter
+
+If users use Open WebUI, CLI, or your own apps later, everyone gets sane defaults even if the UI doesn’t enforce them.
+
+## 3.2 Set defaults/limits in Open WebUI (UI guardrails)
+
+Exact menu names can vary by version, but the practical controls are:
+
+* **Per-model defaults** (context length, max tokens, temperature, top_k/top_p)
+* **Per-user limits / rate limits** (if available)
+* **Disable model parameter editing for non-admins** (if available)
+* **Disable external connectors / web browsing** (if org requires)
+
+What to do in UI (conceptually):
+
+1. Admin → Settings
+2. Models → set default parameters for each model
+3. Permissions/Users → restrict who can change advanced parameters
+4. Safety/Moderation (if present) → add guardrails
+
+### Hard truth
+
+Open WebUI guardrails are helpful, but **they are not a secure enforcement layer** if users can bypass UI and call Ollama directly. For real enterprise guardrails:
+
+* keep Ollama bound to `127.0.0.1` and only expose Open WebUI
+* or put an authenticated gateway in front of Ollama (later)
+
+---
+
+# 4) Troubleshooting Cheatsheet
+
+## 4.1 “Ollama hangs / generate times out”
+
+1. `/api/tags` responds?
+
+```bash
+curl -sS --max-time 2 http://127.0.0.1:11434/api/tags ; echo
+```
+
+2. restart Ollama:
+
+```bash
+sudo systemctl restart ollama
+```
+
+3. check `/tmp` noexec + SELinux if recurring
+4. check logs:
+
+```bash
+sudo journalctl -u ollama -n 200 --no-pager
+```
+
+## 4.2 “Open WebUI listens but curl never returns”
+
+* WebUI is stuck initializing or blocked
+* restart WebUI in foreground
+* verify Ollama is reachable from same host
+* check WebUI logs:
+
+```bash
+sudo journalctl -u openwebui -n 200 --no-pager
+```
+
+## 4.3 “WebUI doesn’t show model”
+
+* Ollama doesn’t list it:
+
+```bash
+curl -sS http://127.0.0.1:11434/api/tags | jq
+```
+
+* fix model import/create
+* confirm WebUI uses correct `OLLAMA_BASE_URL`
+
+---
+
+# 5) Scaling Strategy (CPU Reality)
+
+## 5.1 What scales and what doesn’t
+
+* Open WebUI scales horizontally easily (stateless-ish if DB externalized)
+* Ollama + GGUF on CPU does **not** scale like a web app:
+
+  * KV cache is per process and per active chat
+  * each Ollama replica needs model storage and lots of RAM
+  * concurrency kills latency
+
+## 5.2 Practical CPU scaling patterns
+
+### Pattern A: Single Ollama for pilot
+
+* simplest, but limited concurrency
+
+### Pattern B: “One Ollama per node” (DaemonSet) + router (recommended for enterprise CPU)
+
+* local NVMe for models
+* multiple nodes = more capacity
+* route traffic across nodes
+* keep per-node concurrency capped
+
+### Pattern C: Switch inference backend for real scale
+
+If you need serious throughput/latency, consider:
+
+* GPUs
+* or HF weights + an inference server designed for batching/throughput
+  (Ollama is fine, but it’s not magic.)
+
+## 5.3 Guardrails that prevent user complaints
+
+* cap `num_predict`
+* keep `num_ctx` conservative
+* enable streaming for perceived speed
+* rate limit / concurrency limit at ingress/gateway
+* set clear “acceptable use” (no 8k context + 4k output for everyone)
+
+---
+
+# 6) Kubernetes Deployment (Manifests)
+
+Below are baseline manifests you can apply. These assume:
+
+* namespace `llm`
+* Ollama uses a PVC for `/root/.ollama`
+* Open WebUI uses a PVC for `/app/backend/data`
+* Open WebUI points to `http://ollama:11434`
+
+> Note: You must adjust StorageClass, PVC sizes, node selectors, resource limits for your cluster.
+
+## 6.1 Namespace
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+```
+
+## 6.2 Ollama PVC + Deployment + Service
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models-pvc
+  namespace: llm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 200Gi
+  # storageClassName: gp3   # <-- set as needed
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - name: http
+              containerPort: 11434
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "30m"
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /root/.ollama
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "32"
+              memory: "96Gi"
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: ollama-models-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: llm
+spec:
+  selector:
+    app: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: 11434
+```
+
+### Resource sizing guidance for Ollama pod (CPU)
+
+You asked for “highest RAM and CPU”.
+
+* In k8s you *can* set limits high, but the node must have it.
+* Practical starting points:
+
+  * **Requests**: CPU 4–8, RAM 16–32Gi
+  * **Limits**: CPU up to physical cores, RAM sized for model + concurrency
+* For large models or high concurrency, expect **64–128Gi** RAM per pod.
+
+**Important:** If you set limits > node capacity, scheduling fails. Don’t over-claim.
+
+## 6.3 Open WebUI PVC + Deployment + Service
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwebui-data-pvc
+  namespace: llm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+  # storageClassName: gp3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openwebui
+  namespace: llm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: openwebui
+  template:
+    metadata:
+      labels:
+        app: openwebui
+    spec:
+      containers:
+        - name: openwebui
+          image: ghcr.io/open-webui/open-webui:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama:11434"
+          volumeMounts:
+            - name: webui-data
+              mountPath: /app/backend/data
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+      volumes:
+        - name: webui-data
+          persistentVolumeClaim:
+            claimName: openwebui-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openwebui
+  namespace: llm
+spec:
+  selector:
+    app: openwebui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+```
+
+### Ingress (example placeholder)
+
+Use your standard ingress controller. The key is TLS + auth (OIDC) for enterprise.
+
+---
+
+# 7) Deploying Large Fine-Tuned Models in Kubernetes
+
+You asked: model is huge, built on a server, how do we deploy it?
+
+## 7.1 The correct mental model
+
+Ollama stores model artifacts under `/root/.ollama` (inside the container/pod).
+In k8s, you **must** persist this with a PVC.
+
+So “deploying models” means “populate the Ollama PVC”.
+
+## 7.2 Recommended model population patterns
+
+### Pattern A: Preload models with a Kubernetes Job (repeatable)
+
+* Job mounts the same `ollama-models-pvc`
+* Job pulls/creates models into that PVC
+* Ollama Deployment then uses already-populated PVC
+
+Example Job (pull from registry):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-preload
+  namespace: llm
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: preload
+          image: ollama/ollama:latest
+          env:
+            - name: OLLAMA_HOST
+              value: "127.0.0.1:11434"
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              ollama serve &
+              sleep 2
+              ollama pull qwen2:0.5b
+              # add more pulls/creates here
+              ollama list
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /root/.ollama
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: ollama-models-pvc
+```
+
+### Pattern B: Import your own fine-tuned GGUF from object storage
+
+* Store `*.gguf` in S3/minio/artifact repo
+* Job downloads it into a staging path, runs `ollama create` with a Modelfile
+* Writes into `/root/.ollama` on PVC
+
+Example Job snippet (pseudo, you must provide download command/creds):
+
+```sh
+aws s3 cp s3://YOURBUCKET/models/qwen-cloudqa.gguf /models/qwen-cloudqa.gguf
+
+cat > /tmp/Modelfile <<'EOF'
+FROM /models/qwen-cloudqa.gguf
+PARAMETER num_ctx 2048
+PARAMETER num_predict 512
+PARAMETER temperature 0.3
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+EOF
+
+ollama create qwen-cloudqa:latest -f /tmp/Modelfile
+```
+
+### Pattern C: Bake models into a container image (not recommended)
+
+* images become enormous
+* slow pulls
+* painful rollouts
+
+## 7.3 How Open WebUI sees models in k8s
+
+Same as Linux:
+
+* WebUI calls `http://ollama:11434/api/tags`
+* It doesn’t need the GGUF files
+* It only needs the Ollama Service reachable in cluster DNS
+
+---
+
+# 8) Best Practices for Enterprise Rollout
+
+## 8.1 Security
+
+* Put Open WebUI behind TLS + corporate auth (OIDC at ingress)
+* Do **not** expose Ollama directly to end users
+* NetworkPolicy: only allow WebUI → Ollama
+* Consider audit logging (who asked what, latency, model used)
+
+## 8.2 Reliability
+
+* Liveness/readiness probes on Ollama `/api/tags`
+* Systemd restart policies on Linux; k8s restart policies in cluster
+* If Ollama gets wedged, restart clears it (you saw that)
+
+## 8.3 Performance + User experience
+
+* Enable streaming for UI chats
+* Cap `num_predict` and keep `num_ctx` conservative
+* Prefer quantized GGUF (Q4_K_M) for CPU
+* Avoid F16 unless you know exactly why you want it
+
+## 8.4 Scaling strategy (CPU)
+
+* For serious load: multiple nodes, potentially **one Ollama per node**
+* Control concurrency at ingress/gateway
+* Use smaller models for general chat; reserve bigger models for limited groups
+
+---
+
+# 9) MLOps Pipeline (Practical, Repeatable)
+
+## 9.1 Artifact pipeline
+
+1. Fine-tune model → produce GGUF (or convert to GGUF)
+2. Store GGUF + Modelfile in artifact repository (S3 / Artifactory)
+3. CI pipeline publishes:
+
+   * `model.gguf`
+   * `Modelfile`
+   * metadata (version, commit, quant, context limits)
+
+## 9.2 Deployment pipeline to k8s
+
+1. Apply/upgrade Ollama + WebUI manifests (Helm/Kustomize)
+2. Run “preload job” to populate models into PVC
+3. Roll Ollama deployment (if needed)
+4. Validate:
+
+   * `/api/tags` includes expected models
+   * Open WebUI shows models
+   * smoke test prompt on each model
+
+## 9.3 Rollback
+
+* Version models by tag: `qwen-cloudqa:v2026-01-11`
+* Don’t overwrite `latest` without keeping old tag
+* Rollback = point UI/users to previous tag or delete the new tag
+
+---
+
+# 10) “What if something goes wrong?” (Where to look)
+
+## Linux
+
+* Ollama logs:
+
+```bash
+sudo journalctl -u ollama -n 200 --no-pager
+```
+
+* Open WebUI logs:
+
+```bash
+sudo journalctl -u openwebui -n 200 --no-pager
+```
+
+* Ports:
+
+```bash
+sudo ss -lntp | egrep ':(11434|8080)\b'
+```
+
+* Quick health:
+
+```bash
+curl -sS --max-time 2 http://127.0.0.1:11434/api/tags ; echo
+curl -sS --max-time 2 http://127.0.0.1:8080/ -I ; echo
+```
+
+## Kubernetes
+
+* Ollama pods:
+
+```bash
+kubectl -n llm get pods -o wide
+kubectl -n llm logs deploy/ollama --tail=200
+kubectl -n llm exec deploy/ollama -- curl -sS http://127.0.0.1:11434/api/tags
+```
+
+* Open WebUI pods:
+
+```bash
+kubectl -n llm logs deploy/openwebui --tail=200
+kubectl -n llm exec deploy/openwebui -- sh -lc 'echo $OLLAMA_BASE_URL; wget -qO- $OLLAMA_BASE_URL/api/tags | head'
+```
+
+---
+
+# What you likely missed (high-impact additions)
+
+1. **Don’t expose Ollama publicly.** Expose WebUI only (auth + TLS).
+2. **NetworkPolicy** in k8s: restrict access to Ollama service.
+3. **Externalize WebUI database** if you want multiple replicas cleanly (Postgres). PVC works, but multi-replica + single RWX is tricky depending on storage.
+4. **Version models** and keep a rollback tag.
+5. **Concurrency control** (ingress rate limit / max connections). CPU will melt otherwise.
+
+---
+
+## If you want, I can also give you:
+
+* Helm chart layout for both components
+* NetworkPolicy + Ingress with OIDC examples (NGINX/ALB)
+* A full “preload job” that pulls GGUF from S3 with IAM role for service account
+* A smoke-test job that validates each model after rollout
+
+If you tell me your Kubernetes platform (EKS vs Rancher) and storage (EBS vs Ceph/NFS/local NVMe), I’ll tailor the manifests and the model preload strategy to something that won’t fall apart under real employee traffic.
