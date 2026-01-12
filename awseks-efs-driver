@@ -1,0 +1,4 @@
+aws-efs-csi-driver:v2.2.0
+livenessprobe:v2.15.0-eks-1-33-9
+node-driver-registrar:v2.13.0-eks-1-33-9
+csi-provisioner:v6.1.0-eksbuild.2
